@@ -1,8 +1,9 @@
+from bs4 import BeautifulSoup
 from typing import Annotated, Tuple
 from urllib.parse import urlparse, urlunparse
 
-import markdownify
-import readabilipy.simple_json
+import logging
+
 from mcp.shared.exceptions import McpError
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -19,8 +20,7 @@ from pydantic import BaseModel, Field
 DEFAULT_USER_AGENT = "ModelContextProtocol/1.0 (Autonomous; +https://github.com/clareliguori/wordhippo-mcp-server)"
 
 ##############################################################################
-# These methods are largely copied from the original fetch mcp server code.
-# They deal with fetching a URL and converting the contents into markdown.
+# Scraping definitions and synonyms from WordHippo HTML content
 ##############################################################################
 
 
@@ -33,16 +33,48 @@ def extract_content_from_html(html: str) -> str:
     Returns:
         Simplified markdown version of the content
     """
-    ret = readabilipy.simple_json.simple_json_from_html_string(
-        html, use_readability=True
-    )
-    if not ret["content"]:
-        return "<error>Page failed to be simplified from HTML</error>"
-    content = markdownify.markdownify(
-        ret["content"],
-        heading_style=markdownify.ATX,
-    )
-    return content
+
+    # Each 'meaning' entry in the page will look like this:
+    # <div class="wordtype">Noun</div>
+    # <div class="tabdesc">Meaning description...</div>
+    # <div class="relatedwords">
+    #   <table border="0" cellpadding="0" cellspacing="0" width="100%">
+    #     <tr>
+    #       <td><a href="motorcycle.html">motorcycle</a></td>
+    #     </tr>
+    #   </table>
+    # </div>
+
+    soup = BeautifulSoup(html, "lxml")
+    word_types_divs = soup.find_all("div", class_="wordtype")
+    output = []
+    for word_type_div in word_types_divs:
+        word_type = str(word_type_div.find(text=True, recursive=False)).strip()
+
+        tabdesc_div = word_type_div.find_next("div", class_="tabdesc")
+        if tabdesc_div is None:
+            # There is a final "wordtype" div containing "Related Words" and has no description
+            continue
+        description = tabdesc_div.get_text().strip()
+
+        relatedwords_div = tabdesc_div.find_next("div", class_="relatedwords")
+        word_table = relatedwords_div.find_next("table")
+        word_cells = word_table.find_all("td")[:20]
+        synonyms = [cell.get_text().strip() for cell in word_cells]
+
+        output.append(f"{word_type}: {description}")
+        output.append(
+            f"Synonyms:\n" + "\n".join([f"- {synonym}" for synonym in synonyms])
+        )
+        output.append("---")
+
+    return "\n\n".join(output)
+
+
+##############################################################################
+# These methods are largely copied from the original fetch mcp server code.
+# They deal with fetching a URL and extracting the contents.
+##############################################################################
 
 
 def get_robots_txt_url(url: str) -> str:
@@ -213,8 +245,17 @@ async def serve(
         if not ignore_robots_txt:
             await check_may_autonomously_fetch_url(url, user_agent, proxy_url)
 
-        content, prefix = await fetch_url(url, user_agent, proxy_url=proxy_url)
-        return [TextContent(type="text", text=f"{prefix}:\n{content}")]
+        try:
+            content, prefix = await fetch_url(url, user_agent, proxy_url=proxy_url)
+            return [TextContent(type="text", text=f"{prefix}:\n{content}")]
+        except Exception as e:
+            logging.exception("Internal error in thesaurus", e)
+            raise McpError(
+                ErrorData(
+                    code=INTERNAL_ERROR,
+                    message=f"Failed to fetch {url} due to {e!r}",
+                )
+            )
 
     options = server.create_initialization_options()
     async with stdio_server() as (read_stream, write_stream):
